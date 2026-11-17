@@ -1,0 +1,261 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Furnishka Label Scanner</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f2f4f7;
+      padding: 15px;
+      margin: 0;
+    }
+    .card {
+      max-width: 520px;
+      margin: auto;
+      padding: 18px;
+      background: white;
+      border-radius: 14px;
+    }
+    h2 { text-align: center; }
+    video {
+      width: 100%;
+      background: #222;
+      border-radius: 10px;
+      margin-top: 10px;
+    }
+    input, button {
+      width: 100%;
+      padding: 13px;
+      margin-top: 10px;
+      box-sizing: border-box;
+      font-size: 16px;
+      border-radius: 8px;
+    }
+    input { border: 1px solid #bbb; }
+    button {
+      border: 0;
+      color: white;
+      background: #1769aa;
+      font-weight: bold;
+    }
+    .stop { background: #c62828; }
+    #status {
+      background: #eef3f8;
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+
+<body>
+<div class="card">
+  <h2>Furnishka Label Scanner</h2>
+
+  <label>Staff Name</label>
+  <input id="staff" placeholder="Enter staff name">
+
+  <video id="video" autoplay playsinline muted></video>
+
+  <button onclick="startScanner()">START SCANNING</button>
+  <button class="stop" onclick="stopScanner()">STOP SCANNING</button>
+
+  <div id="status">Scanner is ready.</div>
+</div>
+
+<script>
+const SCRIPT_URL =
+'https://script.google.com/macros/s/AKfycbwF4Uw5L1qUoYOfARB6yAXkHiJ656klHwk5KNWMqBSJfYA6KnR3IoX384M_0yUAJm4kBw/exec';
+
+const video = document.getElementById('video');
+const statusBox = document.getElementById('status');
+
+let cameraStream = null;
+let worker = null;
+let running = false;
+let busy = false;
+let savedLabels = new Set();
+let detectedLabels = {};
+
+function showStatus(message) {
+  statusBox.innerText = message;
+}
+
+async function startScanner() {
+  if (running) return;
+
+  const staff = document.getElementById('staff').value.trim();
+
+  if (!staff) {
+    alert('Enter Staff Name first.');
+    return;
+  }
+
+  try {
+    showStatus('Opening mobile camera...');
+
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+
+    video.srcObject = cameraStream;
+    await video.play();
+
+    showStatus('Loading OCR engine...');
+
+    worker = await Tesseract.createWorker('eng');
+
+    running = true;
+    showStatus('Camera active. Searching for label...');
+
+    scanLoop();
+
+  } catch (error) {
+    showStatus('Camera/OCR error: ' + error.message);
+    stopScanner();
+  }
+}
+
+async function stopScanner() {
+  running = false;
+
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(track => track.stop());
+    cameraStream = null;
+  }
+
+  if (worker) {
+    await worker.terminate();
+    worker = null;
+  }
+
+  video.srcObject = null;
+  showStatus('Scanning stopped.');
+}
+
+function getField(text, regex) {
+  const match = text.match(regex);
+  return match ? match[1].trim() : '';
+}
+
+function extractLabel(text) {
+  return {
+    shipmentNo: getField(text,
+      /SHIPMENT\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*([A-Z0-9-]+)/i),
+
+    orderId: getField(text,
+      /ORDER\s*ID\s*[:#-]?\s*([A-Z0-9\/-]+)/i),
+
+    customer: getField(text,
+      /CUSTOMER\s*[:#-]?\s*([^\n]+)/i),
+
+    deliveryDate: getField(text,
+      /DELIVERY\s*DATE\s*[:#-]?\s*([0-9\/.-]+)/i),
+
+    sku: getField(text,
+      /SKU\s*[:#-]?\s*([A-Z0-9-]+)/i),
+
+    description: getField(text,
+      /(?:PRODUCT|DESCRIPTION)\s*[:#-]?\s*([^\n]+)/i),
+
+    qty: getField(text,
+      /(?:QTY|QUANTITY)\s*[:#-]?\s*(\d+)/i) || '1'
+  };
+}
+
+async function scanLoop() {
+  if (!running) return;
+
+  if (!busy && video.readyState >= 2) {
+    busy = true;
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      canvas.getContext('2d').drawImage(
+        video, 0, 0, canvas.width, canvas.height
+      );
+
+      const result = await worker.recognize(canvas);
+      const data = extractLabel(result.data.text);
+
+      if (data.shipmentNo && data.sku) {
+        const key = data.shipmentNo + '|' + data.sku;
+
+        detectedLabels[key] = (detectedLabels[key] || 0) + 1;
+
+        if (detectedLabels[key] >= 2 && !savedLabels.has(key)) {
+          savedLabels.add(key);
+          showStatus('Label detected. Sending data...');
+
+          sendToGoogleSheet(data, key);
+        } else if (!savedLabels.has(key)) {
+          showStatus('Label detected. Confirming...');
+        } else {
+          showStatus('Label already processed: ' + data.shipmentNo);
+        }
+      } else {
+        detectedLabels = {};
+        showStatus('Searching for label...');
+      }
+
+    } catch (error) {
+      showStatus('OCR error: ' + error.message);
+    }
+
+    busy = false;
+  }
+
+  if (running) {
+    setTimeout(scanLoop, 1500);
+  }
+}
+
+async function sendToGoogleSheet(data, key) {
+  const record = {
+    staffName: document.getElementById('staff').value.trim(),
+    shipmentNo: data.shipmentNo,
+    orderId: data.orderId,
+    customer: data.customer,
+    deliveryDate: data.deliveryDate,
+    sku: data.sku,
+    description: data.description,
+    qty: data.qty,
+    photoUrl: ''
+  };
+
+  try {
+    const body = new URLSearchParams();
+    body.append('payload', JSON.stringify(record));
+
+    await fetch(SCRIPT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      body: body
+    });
+
+    showStatus(
+      'Data sent for saving: ' + data.shipmentNo +
+      '. Please verify in Google Sheet.'
+    );
+
+  } catch (error) {
+    savedLabels.delete(key);
+    showStatus('Sending failed: ' + error.message);
+  }
+}
+</script>
+</body>
+</html>
